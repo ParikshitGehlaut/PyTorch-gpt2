@@ -91,7 +91,10 @@ class GPT(nn.Module):
         
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
         
-    def forward(self, idx):
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+        
+    def forward(self, idx, targets=None):
         # shape of idx is: (B, T)
         B, T = idx.shape
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -108,8 +111,10 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
         # (B, T, n_embed) --> (B, T, vocab_size)
         logits = self.lm_head(x)
-        
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
         
         
     @classmethod
@@ -162,6 +167,7 @@ class GPT(nn.Module):
         return model
 
 # -----------------------------------------------------------------------------------------------
+import tiktoken
 
 num_return_sequences = 5
 max_length = 30
@@ -177,14 +183,56 @@ elif torch.backends.mps.is_available() and ALLOW_MPS:
     
 print(f"Using device {device}")
     
-model = GPT.from_pretrained('gpt2')
-model.eval()
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+        
+        with open('input.txt', 'r') as f:
+            data = f.read()
+            
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(data)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
+        
+        self.current_position = 0
+        
+    def next_batch(self):
+        B, T = self.B, self.T
+        
+        buf = torch.tensor(self.tokens[self.current_position: self.current_position+ B*T + 1], device=device)
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+        
+        self.current_position += B*T
+        
+        if self.current_position + (B*T + 1) > len(self.tokens):
+            self.current_position = 0
+            
+        return x, y
+
+trainloader = DataLoaderLite(4, 32)
+
+# model = GPT.from_pretrained('gpt2')
+model = GPT(GPTConfig())
 model.to(device=device)
 
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = trainloader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step: {i+1}, loss: {loss.item()}")
+    
 
-# prefix tokens
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
+import sys
+sys.exit(0)
+
 tokens = enc.encode("Hello, I'm a language Model")
 tokens = torch.tensor(tokens, dtype=torch.long, device=device) # shape: (8, )
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # shape: (5, 8)
