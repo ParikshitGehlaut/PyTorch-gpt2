@@ -93,6 +93,17 @@ class GPT(nn.Module):
         
         # weight sharing scheme
         self.transformer.wte.weight = self.lm_head.weight
+
+        # apply init
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        if isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
         
     def forward(self, idx, targets=None):
         # shape of idx is: (B, T)
@@ -202,7 +213,7 @@ class DataLoaderLite:
     def next_batch(self):
         B, T = self.B, self.T
         
-        buf = torch.tensor(self.tokens[self.current_position: self.current_position+ B*T + 1], device=device)
+        buf = self.tokens[self.current_position : self.current_position + B * T + 1].clone().detach().to(device)
         x = buf[:-1].view(B, T)
         y = buf[1:].view(B, T)
         
@@ -213,21 +224,30 @@ class DataLoaderLite:
             
         return x, y
 
-trainloader = DataLoaderLite(4, 32)
+train_loader = DataLoaderLite(4, 32)
 
 # model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig())
 model.to(device=device)
+# Use torch.compile() with cpu or cuda gpu
+# model = torch.compile(model)
 
+import time 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
 for i in range(50):
-    x, y = trainloader.next_batch()
+    t0 = time.time()
+    x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
     logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"step: {i+1}, loss: {loss.item()}")
+    t1 = time.time()
+    dt = (t1 - t0)  # time difference is in seconds
+    tokens_processed = train_loader.B * train_loader.T
+    tokens_per_sec = (train_loader.B * train_loader.T)/ (t1 - t0)
+    print(f"step: {i+1}| loss: {loss.item():.6f}| dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
     
 
 import sys
@@ -245,7 +265,10 @@ x = tokens
 # generate, right now B = 5 and T = 8 
 # set seed to 42
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
+
 while x.size(1) < max_length:
     with torch.no_grad():
         logits = model(x)
