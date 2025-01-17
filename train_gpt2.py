@@ -245,8 +245,16 @@ class DataLoaderLite:
             self.current_position = 0
             
         return x, y
+    
+    
+total_batch_size = 524288 # 2**19
+B = 16 # micro batch size
+T = 1024 # sequence length
+grad_accum_steps = total_batch_size // (B * T) # 32
+print(f"total desired batch size is {total_batch_size}")
+print(f"=> calculated gradient accumulation steps {grad_accum_steps}")
 
-train_loader = DataLoaderLite(16, 1024)
+train_loader = DataLoaderLite(B=B, T=T)
 
 # model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig(vocab_size=50304))
@@ -257,7 +265,7 @@ model = torch.compile(model)
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 10
-max_steps = 50
+max_steps = 200
 
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -273,17 +281,21 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 import time 
-optimizer = model.configure_optimizers(learning_rate=6e-4, weight_decay = 0.1,device=device)
+optimizer = model.configure_optimizers(learning_rate=6e-4, weight_decay = 0.1, device=device)
 torch.set_float32_matmul_precision('high') # use TensorFloat32 datatype
 
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     
     lr = get_lr(step)
@@ -293,9 +305,10 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0)  # time difference is in seconds
-    tokens_processed = train_loader.B * train_loader.T
-    tokens_per_sec = (train_loader.B * train_loader.T)/ (t1 - t0)
-    print(f"step: {step+1}| lr: {lr:.6f} | loss: {loss.item():.6f}| norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps)/ (t1 - t0)
+    if (step+1)%10 == 0:
+        print(f"step: {step+1}| lr: {lr:.6f} | loss: {loss_accum.item():.6f}| norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
     
 
 import sys
