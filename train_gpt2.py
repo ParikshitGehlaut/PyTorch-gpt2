@@ -4,7 +4,8 @@ from torch import nn
 from torch.nn import functional as F 
 import math
 import inspect 
-
+import tiktoken
+import os
 # -----------------------------------------------------------------------------------------------
 
 @dataclass
@@ -200,21 +201,34 @@ class GPT(nn.Module):
         return model
 
 # -----------------------------------------------------------------------------------------------
-import tiktoken
+# run the training loop
+
+from torch.distributed import init_process_group, destroy_process_group
+
+ddp = int(os.environ.get('RANK', -1)) != -1
+
+if ddp:
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_rank = int(os.environ['WORLD_RANK'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_rank = 1
+    master_process = True
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    print(f"Using device {device}")
 
 num_return_sequences = 5
 max_length = 30
-
-ALLOW_CUDA = True
-ALLOW_MPS = True
-
-device = "cpu"
-if torch.cuda.is_available() and ALLOW_CUDA:
-    device = "cuda"
-elif torch.backends.mps.is_available() and ALLOW_MPS:
-    device = "mps"
-    
-print(f"Using device {device}")
     
 class DataLoaderLite:
     def __init__(self, B, T):
@@ -248,11 +262,12 @@ class DataLoaderLite:
     
     
 total_batch_size = 524288 # 2**19
-B = 16 # micro batch size
+B = 2 # micro batch size
 T = 1024 # sequence length
-grad_accum_steps = total_batch_size // (B * T) # 32
-print(f"total desired batch size is {total_batch_size}")
-print(f"=> calculated gradient accumulation steps {grad_accum_steps}")
+grad_accum_steps = total_batch_size // (B * T * ddp_world_rank) # 32,   if ddp_world_rank is more than 1 then grad_accum_steps is less than 32 
+if master_process:
+    print(f"total desired batch size is {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps {grad_accum_steps}")
 
 train_loader = DataLoaderLite(B=B, T=T)
 
@@ -260,7 +275,7 @@ train_loader = DataLoaderLite(B=B, T=T)
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device=device)
 # Use torch.compile() with cpu or cuda gpu
-model = torch.compile(model)
+# model = torch.compile(model)
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -302,7 +317,10 @@ for step in range(max_steps):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step()
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    if torch.backends.mps.is_available():
+        torch.mps.synchronize()
     t1 = time.time()
     dt = (t1 - t0)  # time difference is in seconds
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
