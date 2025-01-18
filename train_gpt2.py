@@ -273,7 +273,7 @@ class DataLoaderLite:
     
     
 total_batch_size = 524288 # 2**19
-B = 2 # micro batch size
+B = 64 # micro batch size
 T = 1024 # sequence length
 grad_accum_steps = total_batch_size // (B * T * ddp_world_rank) # 32,   if ddp_world_rank is more than 1 then grad_accum_steps is less than 32 
 if master_process:
