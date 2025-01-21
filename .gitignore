@@ -171,3 +171,5 @@ cython_debug/
 .pypirc
 
 edu_fineweb10B
+hellaswag
+log
