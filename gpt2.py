@@ -1,12 +1,8 @@
-from dataclasses import dataclass
 import torch
 from torch import nn
 from torch.nn import functional as F 
-import math
 import inspect 
-import tiktoken
-import os
-# -----------------------------------------------------------------------------------------------
+from dataclasses import dataclass
 
 @dataclass
 class GPTConfig:
@@ -14,8 +10,8 @@ class GPTConfig:
     vocab_size: int = 50257
     n_layer: int = 12
     n_head: int = 12
-    n_embed: int = 768    
-    
+    n_embed: int = 768   
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -199,190 +195,3 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
-
-# -----------------------------------------------------------------------------------------------
-# run the training loop
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
-import torch.distributed as dist
-
-ddp = int(os.environ.get('RANK', -1)) != -1
-print(f"Using DDP: {ddp}")
-
-if ddp:
-    backend = 'nccl' if torch.cuda.is_available() else 'gloo'
-    try:
-        init_process_group(backend=backend)
-    except ValueError as e:
-        print(f"Failed to initialize process group: {e}")
-        sys.exit(1)
-
-    ddp_rank = int(os.environ.get('RANK', 0))
-    ddp_local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    ddp_world_rank = int(os.environ.get('WORLD_RANK', 1))
-    device = f'cuda:{ddp_local_rank}' if torch.cuda.is_available() else 'cpu'
-    torch.cuda.set_device(device)
-    master_process = ddp_rank == 0
-else:
-    ddp_rank = 0
-    ddp_local_rank = 0
-    ddp_world_rank = 1
-    master_process = True
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif torch.backends.mps.is_available():
-        device = "mps"
-
-num_return_sequences = 5
-max_length = 30
-    
-class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes):
-        self.B = B
-        self.T = T
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-        
-        
-        
-        with open('input.txt', 'r') as f:
-            data = f.read()
-            
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(data)
-        self.tokens = torch.tensor(tokens)
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
-        
-        self.current_position = self.B * self.T * self.process_rank
-        
-    def next_batch(self):
-        B, T = self.B, self.T
-        
-        buf = self.tokens[self.current_position : self.current_position + B * T + 1].clone().detach().to(device)
-        x = buf[:-1].view(B, T)
-        y = buf[1:].view(B, T)
-        
-        self.current_position += B * T * self.num_processes
-        
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.current_position = self.B * self.T * self.process_rank
-            
-        return x, y
-    
-    
-total_batch_size = 524288 # 2**19
-B = 64 # micro batch size
-T = 1024 # sequence length
-grad_accum_steps = total_batch_size // (B * T * ddp_world_rank) # 32,   if ddp_world_rank is more than 1 then grad_accum_steps is less than 32 
-if master_process:
-    print(f"total desired batch size is {total_batch_size}")
-    print(f"=> calculated gradient accumulation steps {grad_accum_steps}")
-    
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_rank)
-
-# model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig(vocab_size=50304))
-model.to(device=device)
-model = torch.compile(model)
-
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module if ddp else model
-
-max_lr = 6e-4
-min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 200
-
-def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_steps:
-        return max_lr * (it + 1)/warmup_steps
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > max_steps:
-        return min_lr 
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos (math.pi * decay_ratio)) # coeff starts at 1 and goes to ® 
-    return min_lr + coeff * (max_lr - min_lr)
-
-import time 
-optimizer = raw_model.configure_optimizers(learning_rate=6e-4, weight_decay = 0.1, device=device)
-torch.set_float32_matmul_precision('high') # use TensorFloat32 datatype
-
-for step in range(max_steps):
-    t0 = time.time()
-    optimizer.zero_grad()
-    loss_accum = 0.0
-    for micro_step in range(grad_accum_steps):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-        loss = loss / grad_accum_steps
-        loss_accum += loss.detach()
-        if ddp:
-            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-        loss.backward()
-    if ddp:
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    optimizer.step()
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    if torch.backends.mps.is_available():
-        torch.mps.synchronize()
-    t1 = time.time()
-    dt = (t1 - t0)  # time difference is in seconds
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_rank
-    tokens_per_sec = tokens_processed / dt
-    if master_process:
-        print(f"step: {step+1}| lr: {lr:.6f} | loss: {loss_accum.item():.6f}| norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-    
-    
-if ddp:
-    destroy_process_group()
-
-import sys
-sys.exit(0)
-
-tokens = enc.encode("Hello, I'm a language Model")
-tokens = torch.tensor(tokens, dtype=torch.long, device=device) # shape: (8, )
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # shape: (5, 8)
-
-x = tokens
-
-# sampling loop
-# B --> Batch_size
-# T --> sequence_length
-# generate, right now B = 5 and T = 8 
-# set seed to 42
-torch.manual_seed(42)
-
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(42)
-
-while x.size(1) < max_length:
-    with torch.no_grad():
-        logits = model(x)
-        # take logits at the last position
-        logits = logits[:, -1, :] # (B, vocab_size)
-        probs = F. softmax(logits, dim=-1)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-
-        ix = torch.multinomial(topk_probs, 1) # (B, 1)
-        # gather the corresponding indices
-        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-        # append to the sequence
-        x = torch.cat((x, xcol), dim=1)
-    
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    print(">", enc.decode(tokens))
