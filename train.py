@@ -135,8 +135,8 @@ raw_model = model.module if ddp else model
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 500
-max_steps = 18000
+warmup_steps = 715
+max_steps = 19017
 
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -268,43 +268,3 @@ for step in range(max_steps):
     
 if ddp:
     destroy_process_group()
-
-# import sys
-# sys.exit(0)
-
-# num_return_sequences = 5
-# max_length = 30
-
-# tokens = enc.encode("Hello, I'm a language Model")
-# tokens = torch.tensor(tokens, dtype=torch.long, device=device) # shape: (8, )
-# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # shape: (5, 8)
-
-# x = tokens
-
-# # sampling loop
-# # B --> Batch_size
-# # T --> sequence_length
-# # generate, right now B = 5 and T = 8 
-# # set seed to 42
-# torch.manual_seed(42)
-
-# if torch.cuda.is_available():
-#     torch.cuda.manual_seed(42)
-
-# while x.size(1) < max_length:
-#     with torch.no_grad():
-#         logits = model(x)
-#         # take logits at the last position
-#         logits = logits[:, -1, :] # (B, vocab_size)
-#         probs = F. softmax(logits, dim=-1)
-#         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-
-#         ix = torch.multinomial(topk_probs, 1) # (B, 1)
-#         # gather the corresponding indices
-#         xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-#         # append to the sequence
-#         x = torch.cat((x, xcol), dim=1)
-    
-# for i in range(num_return_sequences):
-#     tokens = x[i, :max_length].tolist()
-#     print(">", enc.decode(tokens))
