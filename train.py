@@ -8,6 +8,8 @@ import sys
 from hellaswag import render_example, iterate_examples
 from gpt2 import GPT, GPTConfig
     
+torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
+torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
 # -----------------------------------------------------------------------------------------------
 # run the training loop
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -124,19 +126,18 @@ if master_process:
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_rank, split="train")
 val_loader =  DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_rank, split="val")
 
-# model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device=device)
-# model = torch.compile(model)
+# model = torch.compile(model, backend="eager")
 
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model
 
-max_lr = 6e-4
+max_lr = 6e-4 
 min_lr = max_lr * 0.1
 warmup_steps = 715
-max_steps = 19017
+max_steps = 19073  # ~ 1 epoch 
 
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
